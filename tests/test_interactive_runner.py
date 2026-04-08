@@ -13,7 +13,7 @@ from codex_runner.runner import JudgeDecision, JudgeWatcher
 
 
 class InteractiveWatcherTests(unittest.TestCase):
-    def test_run_judge_uses_isolated_subprocess_and_never_injects_into_judge_pane(self) -> None:
+    def test_run_judge_uses_visible_judge_pane_and_waits_for_decision_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_plan(repo, "Finish the repo")
@@ -37,11 +37,15 @@ class InteractiveWatcherTests(unittest.TestCase):
             )
             watcher.logs_dir.mkdir(parents=True, exist_ok=True)
             watcher.tmux = Mock()
-            watcher.tmux.send_keys.side_effect = AssertionError("judge pane should not receive automatic watcher injections")
+            watcher.tmux.capture_pane.return_value = ""
+            watcher.tmux.pane_current_command.return_value = "codex"
+            state = type("State", (), {"judge_session_id": "judge-1"})()
 
-            def fake_run(args: list[str], **kwargs):
-                output_index = args.index("-o") + 1
-                decision_path = Path(args[output_index])
+            def fake_send_keys(_pane: str, text: str, *, press_enter: bool = True) -> None:
+                marker = "Write the JSON decision to "
+                start = text.index(marker) + len(marker)
+                end = text.index(". Do not ask the human anything.", start)
+                decision_path = Path(text[start:end])
                 decision_path.write_text(
                     json.dumps(
                         {
@@ -55,14 +59,8 @@ class InteractiveWatcherTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                class Result:
-                    returncode = 0
-                    stdout = "auto judge ok"
-                    stderr = ""
-
-                return Result()
-
-            with patch("codex_runner.runner.subprocess.run", side_effect=fake_run) as mock_run:
+            watcher.tmux.send_keys.side_effect = fake_send_keys
+            with patch.object(watcher, "_ensure_judge_session", return_value="judge-1") as ensure_mock:
                 decision, judge_exit = watcher._run_judge(
                     contract=type("Contract", (), {"task": "Finish the repo"})(),
                     finish_markdown="# Finish",
@@ -71,19 +69,15 @@ class InteractiveWatcherTests(unittest.TestCase):
                         checks=[CheckResult(name="todo", passed=False, detail="active")],
                     ),
                     pane_text="worker idle",
-                    state=type("State", (), {})(),
+                    state=state,
                 )
 
             self.assertEqual(judge_exit, 0)
             self.assertEqual(decision.decision, "continue")
-            self.assertEqual(mock_run.call_count, 1)
-            command = mock_run.call_args.args[0]
-            self.assertIn("exec", command)
-            self.assertIn("--ephemeral", command)
-            self.assertIn("--output-schema", command)
-            watcher.tmux.send_keys.assert_not_called()
+            ensure_mock.assert_called_once()
+            watcher.tmux.send_keys.assert_called_once()
 
-    def test_run_clears_stale_watcher_pid_after_successful_completion(self) -> None:
+    def test_run_resets_to_standby_after_successful_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_plan(repo, "Finish the repo")
@@ -155,13 +149,16 @@ class InteractiveWatcherTests(unittest.TestCase):
                 )
             )
 
-            exit_code = watcher.run()
+            with patch("codex_runner.runner.time.sleep", side_effect=SystemExit(0)):
+                with self.assertRaises(SystemExit):
+                    watcher.run()
 
-            self.assertEqual(exit_code, 0)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["status"], "complete")
-            self.assertIsNone(saved["watcher_pid"])
-            watcher.tmux.kill.assert_called_once()
+            self.assertEqual(saved["status"], "running")
+            self.assertTrue(saved["standby"])
+            self.assertIsNone(saved["worker_session_id"])
+            watcher.tmux.run_script.assert_called_once()
+            watcher.tmux.kill.assert_not_called()
 
     def test_should_shower_only_on_configured_continue_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -347,15 +344,10 @@ class InteractiveWatcherTests(unittest.TestCase):
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertTrue(saved["standby"])
 
-    def test_no_task_session_resets_to_standby_after_complete(self) -> None:
+    def test_no_task_session_switches_to_normal_mode_after_new_prompt_activation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_plan(repo, "Finish the repo")
-            (repo / ".plan" / "WORK_LOCK").unlink()
-            (repo / ".plan" / "TODO.md").write_text(
-                "# TODO\n\n## Backlog\n- [ ] Future slice\n\n## In Progress\n\n## Blocked\n\n## Done\n- [x] Finish the repo\n",
-                encoding="utf-8",
-            )
             state_path = repo / ".plan" / "codex-runner" / "state.json"
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(
@@ -378,8 +370,11 @@ class InteractiveWatcherTests(unittest.TestCase):
                         "window_target": "demo:runner",
                         "cleanup_scope": "session",
                         "worker_reboots": 0,
-                        "standby": False,
+                        "standby": True,
                         "started_without_task": True,
+                        "awaiting_worker_change_after_complete": False,
+                        "completion_latch_hash": None,
+                        "standby_prompt_count": None,
                     }
                 ),
                 encoding="utf-8",
@@ -404,34 +399,30 @@ class InteractiveWatcherTests(unittest.TestCase):
                 shower_timeout_seconds=30,
             )
             watcher.tmux = Mock()
-            watcher.tmux.capture_pane.return_value = "worker idle"
+            watcher.tmux.capture_pane.side_effect = [
+                "› startup prompt\nworker idle",
+                "› startup prompt\n› user task\nworker idle",
+            ]
             watcher.tmux.pane_current_command.return_value = "codex"
             watcher._detect_worker_session_id = Mock(return_value="abc")
-            watcher._is_idle = Mock(return_value=True)
-            watcher._signature = Mock(side_effect=["sig-complete", SystemExit(0)])
-            watcher._run_judge = Mock(
-                return_value=(
-                    JudgeDecision(
-                        decision="complete",
-                        summary="done",
-                        reasons=["all clear"],
-                        instructions_for_worker="",
-                        missing_checks=[],
-                    ),
-                    0,
-                )
-            )
+            watcher._run_judge = Mock()
 
-            with patch("codex_runner.runner.time.sleep", side_effect=SystemExit(0)):
+            sleep_calls = {"count": 0}
+
+            def fake_sleep(_seconds: float) -> None:
+                sleep_calls["count"] += 1
+                if sleep_calls["count"] >= 2:
+                    raise SystemExit(0)
+
+            with patch("codex_runner.runner.time.sleep", side_effect=fake_sleep):
                 with self.assertRaises(SystemExit):
                     watcher.run()
 
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertTrue(saved["standby"])
-            self.assertTrue(saved["started_without_task"])
+            self.assertFalse(saved["standby"])
+            self.assertFalse(saved["started_without_task"])
             self.assertEqual(saved["status"], "running")
-            watcher.tmux.run_script.assert_called_once()
-            watcher.tmux.kill.assert_not_called()
+            watcher._run_judge.assert_not_called()
 
 
 if __name__ == "__main__":

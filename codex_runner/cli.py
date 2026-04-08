@@ -36,7 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--idle-seconds", type=int, default=8)
     run_parser.add_argument("--poll-seconds", type=int, default=3)
     run_parser.add_argument("--no-shower", action="store_true", help="Disable automatic worker reboot handoffs in interactive mode")
-    run_parser.add_argument("--shower-interval", type=int, default=5, help="Reboot the worker after this many interactive judge cycles (default: 5)")
+    run_parser.add_argument("--shower-interval", type=int, default=10, help="Reboot the worker after this many interactive judge cycles (default: 10)")
     run_parser.add_argument("--shower-timeout-seconds", type=int, default=180, help="How long to wait for the worker handoff summary before forcing a reboot (default: 180)")
 
     status_parser = subparsers.add_parser("status", help="Print the last runner state")
@@ -61,7 +61,7 @@ def _parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--idle-seconds", type=int, default=8)
     watch_parser.add_argument("--poll-seconds", type=int, default=3)
     watch_parser.add_argument("--shower-enabled", action="store_true")
-    watch_parser.add_argument("--shower-interval", type=int, default=5)
+    watch_parser.add_argument("--shower-interval", type=int, default=10)
     watch_parser.add_argument("--shower-timeout-seconds", type=int, default=180)
 
     return parser
