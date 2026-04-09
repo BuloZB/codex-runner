@@ -168,6 +168,37 @@ def _worker_turn_summary_from_event(event: dict[str, Any]) -> str:
     )
 
 
+def _worker_maybe_claims_completion(event: dict[str, Any]) -> bool:
+    message = str(event.get("last_assistant_message") or "").strip().lower()
+    if not message:
+        return False
+    negative_markers = (
+        "not complete",
+        "not finished",
+        "still not complete",
+        "still not finished",
+        "remaining work",
+        "branch is still not complete",
+        "not in a finishable state",
+        "i did not edit anything in this turn",
+    )
+    if any(marker in message for marker in negative_markers):
+        return False
+    completion_markers = (
+        "task is complete",
+        "task complete",
+        "done.",
+        "all set",
+        "finished for now",
+        "no remaining work",
+        "no further work",
+        "closeout criteria are currently satisfied",
+        "the cleanup closeout criteria are currently satisfied",
+        "really finished",
+    )
+    return any(marker in message for marker in completion_markers)
+
+
 def _shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
@@ -1760,13 +1791,19 @@ class JudgeWatcher:
                             turn_id=turn_id,
                         )
 
-                    deterministic_report = run_deterministic_checks(self.repo_root, contract)
+                    include_verify_commands = _worker_maybe_claims_completion(worker_event)
+                    deterministic_report = run_deterministic_checks(
+                        self.repo_root,
+                        contract,
+                        include_verify_commands=include_verify_commands,
+                    )
                     self._log_watcher_event(
                         "worker_turn_completed",
                         worker_pane=self.worker_pane,
                         worker_session_id=state.worker_session_id,
                         turn_id=turn_id,
                         deterministic_passed=deterministic_report.passed,
+                        include_verify_commands=include_verify_commands,
                     )
                     decision, judge_exit = self._run_judge(
                         contract,

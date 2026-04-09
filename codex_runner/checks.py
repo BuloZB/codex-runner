@@ -90,7 +90,12 @@ def _run_verify_command(repo_root: Path, command: VerifyCommand) -> CheckResult:
     )
 
 
-def run_deterministic_checks(repo_root: Path, contract: FinishContract) -> DeterministicReport:
+def run_deterministic_checks(
+    repo_root: Path,
+    contract: FinishContract,
+    *,
+    include_verify_commands: bool = True,
+) -> DeterministicReport:
     checks: list[CheckResult] = []
 
     todo_path = repo_root / ".plan" / "TODO.md"
@@ -154,8 +159,9 @@ def run_deterministic_checks(repo_root: Path, contract: FinishContract) -> Deter
             )
         )
 
-    for command in contract.verify_commands:
-        checks.append(_run_verify_command(repo_root, command))
+    if include_verify_commands:
+        for command in contract.verify_commands:
+            checks.append(_run_verify_command(repo_root, command))
 
     passed = all(check.passed or not check.required for check in checks)
     return DeterministicReport(passed=passed, checks=checks)

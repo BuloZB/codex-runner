@@ -27,6 +27,14 @@ class CheckTests(unittest.TestCase):
             self.assertIn("todo:in-progress-empty", failures)
             self.assertIn("work-lock:absent", failures)
 
+    def test_deterministic_checks_can_skip_verify_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_plan(repo, "Fix the bug")
+            contract, _ = load_finish_contract(repo)
+            report = run_deterministic_checks(repo, contract, include_verify_commands=False)
+            self.assertTrue(all(not check.name.startswith("verify:") for check in report.checks))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from codex_runner.runner import (
     JudgeWatcher,
     _auto_accept_trust_prompt,
     _base_codex_args,
+    _worker_maybe_claims_completion,
 )
 
 
@@ -35,6 +36,18 @@ class InteractiveWatcherTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         tmux.press_enter.assert_called_once_with("%1")
+
+    def test_worker_completion_heuristic_ignores_incomplete_summary(self) -> None:
+        event = {
+            "last_assistant_message": "The branch is still not complete; the remaining open item is RelationLoader.",
+        }
+        self.assertFalse(_worker_maybe_claims_completion(event))
+
+    def test_worker_completion_heuristic_detects_completion_summary(self) -> None:
+        event = {
+            "last_assistant_message": "The cleanup closeout criteria are currently satisfied and no further work remains.",
+        }
+        self.assertTrue(_worker_maybe_claims_completion(event))
 
     def test_run_judge_uses_visible_judge_pane_and_waits_for_decision_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
