@@ -4,6 +4,10 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
+import time
+
+
+SUBMIT_ENTER_DELAY_SECONDS = 0.2
 
 
 @dataclass(slots=True)
@@ -44,11 +48,12 @@ class TmuxSession:
     def create(self) -> PaneLayout:
         if os.environ.get("TMUX"):
             current_session = self._run("display-message", "-p", "#S", capture=True).stdout.strip()
-            if not current_session:
+            current_session_id = self._run("display-message", "-p", "#{session_id}", capture=True).stdout.strip()
+            if not current_session or not current_session_id:
                 raise TmuxError("failed to resolve current tmux session")
             window_name = self._window_name()
-            window_target = f"{current_session}:{window_name}"
-            self._run("new-window", "-d", "-t", current_session, "-n", window_name)
+            window_target = f"{current_session_id}:{window_name}"
+            self._run("new-window", "-d", "-t", current_session_id, "-n", window_name)
             cleanup_scope = "window"
             session_name = current_session
         else:
@@ -91,19 +96,21 @@ class TmuxSession:
         self._run("respawn-pane", "-k", "-t", pane_id, f"bash {script_path}")
 
     def send_keys(self, pane_id: str, text: str, *, press_enter: bool = True) -> None:
-        buffer_name = f"codex-runner-{pane_id.strip('%')}"
-        self._run("set-buffer", "-b", buffer_name, "--", text)
-        try:
-            self._run("paste-buffer", "-d", "-p", "-t", pane_id, "-b", buffer_name)
-        finally:
-            completed = subprocess.run(
-                [self.tmux_bin, "delete-buffer", "-b", buffer_name],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+        lines = text.split("\n")
+        for index, line in enumerate(lines):
+            if index > 0:
+                self._run("send-keys", "-t", pane_id, "Enter")
+            if line:
+                self._run("send-keys", "-t", pane_id, "-l", line)
         if press_enter:
+            # Codex's inline composer keeps a short paste-burst suppression window where Enter
+            # inserts a newline instead of submitting. Wait past that window before the final
+            # submit keystroke so injected messages actually send without manual Enter.
+            time.sleep(SUBMIT_ENTER_DELAY_SECONDS)
             self._run("send-keys", "-t", pane_id, "Enter")
+
+    def press_enter(self, pane_id: str) -> None:
+        self._run("send-keys", "-t", pane_id, "Enter")
 
     def capture_pane(self, pane_id: str, *, lines: int = 200) -> str:
         result = self._run("capture-pane", "-p", "-S", f"-{lines}", "-t", pane_id, capture=True)

@@ -28,6 +28,8 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--tmux-bin", default="tmux")
     run_parser.add_argument("--worker-sandbox", default="danger-full-access")
     run_parser.add_argument("--judge-sandbox", default="danger-full-access")
+    run_parser.add_argument("--worker-approval-policy", default="never")
+    run_parser.add_argument("--judge-approval-policy", default="never")
     run_parser.add_argument("--safe", dest="no_bypass_approvals_and_sandbox", action="store_true", help="Do not pass --dangerously-bypass-approvals-and-sandbox")
     run_parser.add_argument("--no-bypass-approvals-and-sandbox", dest="no_bypass_approvals_and_sandbox", action="store_true", help="Do not pass --dangerously-bypass-approvals-and-sandbox")
     run_parser.add_argument("--batch", action="store_true", help="Use the old non-interactive worker/judge batch loop")
@@ -55,8 +57,10 @@ def _parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--tmux-bin", default="tmux")
     watch_parser.add_argument("--judge-model", default=None)
     watch_parser.add_argument("--judge-sandbox", default="danger-full-access")
+    watch_parser.add_argument("--judge-approval-policy", default="never")
     watch_parser.add_argument("--worker-model", default=None)
     watch_parser.add_argument("--worker-sandbox", default="danger-full-access")
+    watch_parser.add_argument("--worker-approval-policy", default="never")
     watch_parser.add_argument("--dangerous", action="store_true")
     watch_parser.add_argument("--idle-seconds", type=int, default=8)
     watch_parser.add_argument("--poll-seconds", type=int, default=3)
@@ -95,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
                 tmux_bin=args.tmux_bin,
                 worker_sandbox=args.worker_sandbox,
                 judge_sandbox=args.judge_sandbox,
+                worker_approval_policy=args.worker_approval_policy,
+                judge_approval_policy=args.judge_approval_policy,
                 bypass_approvals_and_sandbox=bypass,
             )
             return runner.run()
@@ -109,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
             tmux_bin=args.tmux_bin,
             worker_sandbox=args.worker_sandbox,
             judge_sandbox=args.judge_sandbox,
+            worker_approval_policy=args.worker_approval_policy,
+            judge_approval_policy=args.judge_approval_policy,
             bypass_approvals_and_sandbox=bypass,
             attach=attach,
             idle_seconds=args.idle_seconds,
@@ -138,8 +146,10 @@ def main(argv: list[str] | None = None) -> int:
             tmux_bin=args.tmux_bin,
             judge_model=args.judge_model,
             judge_sandbox=args.judge_sandbox,
+            judge_approval_policy=args.judge_approval_policy,
             worker_model=args.worker_model,
             worker_sandbox=args.worker_sandbox,
+            worker_approval_policy=args.worker_approval_policy,
             bypass_approvals_and_sandbox=args.dangerous,
             idle_seconds=args.idle_seconds,
             poll_seconds=args.poll_seconds,

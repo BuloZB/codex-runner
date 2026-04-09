@@ -15,6 +15,7 @@ htmlcov/
 
 # Plan data (per-repo runner state and development scaffolding)
 .plan/
+.omx/
 
 # IDE
 .vscode/

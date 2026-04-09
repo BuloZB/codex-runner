@@ -82,7 +82,7 @@ class PromptTests(unittest.TestCase):
             task="Ship the fix",
             finish_contract_markdown="# Finish",
             deterministic_report=DeterministicReport(passed=False, checks=[CheckResult(name="todo", passed=False, detail="active")]),
-            worker_console_tail="worker stopped",
+            worker_turn_summary="Worker turn id: turn-1\n\nWorker input messages:\n- do the thing\n\nWorker last assistant message:\nfinished the thing\n",
             repo_context={"status": "M a", "diff_stat": "1 file", "diff_names": "a.py"},
             output_path=Path('/tmp/decision.json'),
         )

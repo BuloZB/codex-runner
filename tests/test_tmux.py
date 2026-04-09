@@ -25,10 +25,11 @@ class TmuxTests(unittest.TestCase):
             mock_run.return_value.stderr = ""
             session.send_keys("%12", "line1\nline2", press_enter=True)
 
-        self.assertEqual(recorded[0], ("set-buffer", "-b", "codex-runner-12", "--", "line1\nline2"))
-        self.assertEqual(recorded[1], ("paste-buffer", "-d", "-p", "-t", "%12", "-b", "codex-runner-12"))
-        self.assertEqual(recorded[2], ("send-keys", "-t", "%12", "Enter"))
-        self.assertTrue(mock_run.called)
+        self.assertEqual(recorded[0], ("send-keys", "-t", "%12", "-l", "line1"))
+        self.assertEqual(recorded[1], ("send-keys", "-t", "%12", "Enter"))
+        self.assertEqual(recorded[2], ("send-keys", "-t", "%12", "-l", "line2"))
+        self.assertEqual(recorded[3], ("send-keys", "-t", "%12", "Enter"))
+        self.assertFalse(mock_run.called)
 
     def test_create_uses_failed_remain_on_exit(self) -> None:
         session = TmuxSession("demo")

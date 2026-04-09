@@ -125,6 +125,8 @@ class IntegrationTests(unittest.TestCase):
                 tmux_bin=shutil.which("tmux") or "tmux",
                 worker_sandbox="workspace-write",
                 judge_sandbox="read-only",
+                worker_approval_policy="never",
+                judge_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
             )
             exit_code = runner.run()

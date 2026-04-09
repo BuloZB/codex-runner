@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .checks import DeterministicReport, run_deterministic_checks
 from .config import FinishContract, init_plan, load_finish_contract
@@ -19,6 +19,8 @@ from .tmux import TmuxSession
 
 SESSION_ID_RE = re.compile(r"session id:\s*([0-9A-Za-z._-]+)")
 SHELL_COMMANDS = {"zsh", "bash", "sh", "fish", "dash", "ksh"}
+TRUST_PROMPT = "Do you trust the contents of this directory?"
+TRUST_ACCEPT_LABEL = "Yes, continue"
 PLACEHOLDER_TASK = "Define the task and finish criteria for this repository."
 
 
@@ -96,7 +98,8 @@ class RunnerState:
     started_without_task: bool = False
     awaiting_worker_change_after_complete: bool = False
     completion_latch_hash: str | None = None
-    standby_prompt_count: int | None = None
+    startup_turn_consumed: bool = False
+    worker_event_offset: int = 0
 
 
 def _now_iso() -> str:
@@ -113,10 +116,12 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps({'timestamp': _now_iso(), **payload}) + '\n')
 
 
-def _base_codex_args(*, sandbox: str, bypass: bool) -> list[str]:
+def _base_codex_args(*, sandbox: str, bypass: bool, approval_policy: str | None = None) -> list[str]:
     args: list[str] = []
     if bypass:
         args.append("--dangerously-bypass-approvals-and-sandbox")
+    elif approval_policy:
+        args.extend(["-a", approval_policy])
     args.extend(["-s", sandbox])
     return args
 
@@ -149,12 +154,67 @@ def _clip_text(text: str, *, max_lines: int, max_chars: int) -> str:
     return clipped[-max_chars:]
 
 
-def _prompt_line_count(text: str) -> int:
-    return sum(1 for line in text.splitlines() if line.startswith("› "))
+def _worker_turn_summary_from_event(event: dict[str, Any]) -> str:
+    input_messages = event.get("input_messages", [])
+    if not isinstance(input_messages, list):
+        input_messages = []
+    inputs = "\n".join(f"- {item}" for item in input_messages if isinstance(item, str)) or "- (none)"
+    last_message = str(event.get("last_assistant_message") or "").strip() or "(none)"
+    turn_id = str(event.get("turn_id") or "").strip() or "(unknown)"
+    return (
+        f"Worker turn id: {turn_id}\n\n"
+        f"Worker input messages:\n{inputs}\n\n"
+        f"Worker last assistant message:\n{last_message}\n"
+    )
 
 
 def _shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
+
+def _notify_hook_argv(*, role: str, output_path: Path) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).with_name("notify_hook.py")),
+        role,
+        str(output_path),
+    ]
+
+
+def _pane_has_trust_prompt(pane_text: str) -> bool:
+    return TRUST_PROMPT in pane_text and TRUST_ACCEPT_LABEL in pane_text
+
+
+def _auto_accept_trust_prompt(
+    tmux: TmuxSession,
+    pane_id: str,
+    *,
+    timeout_seconds: int = 8,
+    on_accept: Callable[[], None] | None = None,
+) -> bool:
+    deadline = time.time() + timeout_seconds
+    sent = False
+    while time.time() < deadline:
+        try:
+            pane_text = tmux.capture_pane(pane_id, lines=80)
+        except Exception:
+            return sent
+        if not isinstance(pane_text, str):
+            pane_text = str(pane_text)
+        if _pane_has_trust_prompt(pane_text):
+            if not sent:
+                tmux.press_enter(pane_id)
+                sent = True
+                if on_accept:
+                    on_accept()
+            time.sleep(0.5)
+            continue
+        if sent:
+            return True
+        if pane_text.strip() or SESSION_ID_RE.search(pane_text) or "OpenAI Codex" in pane_text or "Standing by" in pane_text:
+            return False
+        time.sleep(0.5)
+    return sent
+
 
 
 def _extract_session_id_from_text(text: str) -> str | None:
@@ -375,12 +435,13 @@ Rules:
 - Read and obey `.plan/TODO.md`, `.plan/FINISH_CRITERIA.md`, and `.plan/WORK_LOCK` if present.
 - Ignore `.plan/JUDGE_TODO.md`; that file belongs to the judge.
 - The user may talk to you normally in this session.
-- A separate judge process will evaluate completion. Do not rely on the human to type `continue` if work remains.
+- Your completed turns are forwarded to the judge automatically. Do not rely on the human to type `continue` if work remains.
 - If you think the task is done, make sure the finish criteria and verification commands really pass first.
 - Prefer continuing work over asking whether you should proceed.
 - Never ask `would you like me to continue`, `should I proceed`, `if you want, I can`, or `let me know if you want` when the next local step is discoverable from repo state.
 - Treat human messages like `continue`, `gogogo`, `yes continue`, `go ahead`, and `proceed` as evidence that you previously stopped too early. Do not force the human to repeat those nudges.
 - Do not use `done` or `complete` language unless the whole task is actually finished, not just one sub-slice.
+- When you finish a turn, write a concise, factual assistant message because the judge will review that message.
 
 Finish criteria:
 {finish_contract_markdown}
@@ -429,6 +490,7 @@ Standby rules:
 - Do not claim progress or completion before the user gives you a task.
 - Once the user gives a real task, start working normally.
 - After the user gives a real task, read `.plan/TODO.md`, `.plan/FINISH_CRITERIA.md`, and `.plan/WORK_LOCK` if present and continue from there.
+- After you have a real task, your completed turns are forwarded to the judge automatically.
 """
 
 
@@ -501,13 +563,12 @@ def _build_judge_request_prompt(
     task: str,
     finish_contract_markdown: str,
     deterministic_report: DeterministicReport,
-    worker_console_tail: str,
+    worker_turn_summary: str,
     repo_context: dict[str, str],
     output_path: Path,
 ) -> str:
     deterministic_json = json.dumps(deterministic_report.to_dict(), indent=2)
     output_path_text = str(output_path)
-    worker_tail = _clip_text(worker_console_tail or "(empty)", max_lines=40, max_chars=4000)
     git_status = _clip_text(repo_context["status"] or "(clean)", max_lines=40, max_chars=2500)
     git_diff_stat = _clip_text(repo_context["diff_stat"] or "(no diff stat)", max_lines=30, max_chars=2000)
     git_diff_names = _clip_text(repo_context["diff_names"] or "(no changed files)", max_lines=40, max_chars=2500)
@@ -531,8 +592,8 @@ Finish criteria:
 Deterministic report:
 {deterministic_json}
 
-Worker pane tail:
-{worker_tail}
+Worker turn summary:
+{worker_turn_summary}
 
 Git status:
 {git_status}
@@ -585,6 +646,7 @@ Fresh-session rules:
 - Never ask `would you like me to continue`.
 - Treat human messages like `continue`, `gogogo`, `yes continue` as proof that work should have continued automatically.
 - Do not stop while real work remains.
+- Your completed turns are forwarded to the judge automatically, so keep end-of-turn summaries concise and factual.
 
 Finish criteria:
 {finish_contract_markdown}
@@ -622,6 +684,8 @@ class CodexRunner:
         tmux_bin: str,
         worker_sandbox: str,
         judge_sandbox: str,
+        worker_approval_policy: str,
+        judge_approval_policy: str,
         bypass_approvals_and_sandbox: bool,
     ) -> None:
         self.repo_root = repo_root.resolve()
@@ -634,6 +698,8 @@ class CodexRunner:
         self.tmux_bin = tmux_bin
         self.worker_sandbox = worker_sandbox
         self.judge_sandbox = judge_sandbox
+        self.worker_approval_policy = worker_approval_policy
+        self.judge_approval_policy = judge_approval_policy
         self.bypass_approvals_and_sandbox = bypass_approvals_and_sandbox
         self.plan_dir = self.repo_root / ".plan"
         self.runtime_dir = self.plan_dir / "codex-runner"
@@ -674,7 +740,8 @@ class CodexRunner:
                 started_without_task=bool(payload.get("started_without_task", False)),
                 awaiting_worker_change_after_complete=bool(payload.get("awaiting_worker_change_after_complete", False)),
                 completion_latch_hash=payload.get("completion_latch_hash"),
-                standby_prompt_count=payload.get("standby_prompt_count"),
+                startup_turn_consumed=bool(payload.get("startup_turn_consumed", False)),
+                worker_event_offset=int(payload.get("worker_event_offset", 0)),
             )
         now = _now_iso()
         return RunnerState(status="running", task=task, session_name=session_name, started_at=now, updated_at=now, mode=mode)
@@ -763,7 +830,7 @@ class CodexRunner:
                 )
                 self._write_schema(worker_schema_path, _worker_schema())
 
-                worker_command = [self.codex_bin, "exec", *_base_codex_args(sandbox=self.worker_sandbox, bypass=self.bypass_approvals_and_sandbox)]
+                worker_command = [self.codex_bin, "exec", *_base_codex_args(sandbox=self.worker_sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=self.worker_approval_policy)]
                 if state.worker_session_id:
                     worker_command = [
                         self.codex_bin,
@@ -772,7 +839,7 @@ class CodexRunner:
                         *(
                             ["--dangerously-bypass-approvals-and-sandbox"]
                             if self.bypass_approvals_and_sandbox
-                            else []
+                            else ["-a", self.worker_approval_policy]
                         ),
                         state.worker_session_id,
                     ]
@@ -831,7 +898,7 @@ class CodexRunner:
                 )
                 self._write_schema(judge_schema_path, _judge_schema())
 
-                judge_command = [self.codex_bin, "exec", *_base_codex_args(sandbox=self.judge_sandbox, bypass=self.bypass_approvals_and_sandbox), "--ephemeral", "-C", str(self.repo_root)]
+                judge_command = [self.codex_bin, "exec", *_base_codex_args(sandbox=self.judge_sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=self.judge_approval_policy), "--ephemeral", "-C", str(self.repo_root)]
                 if self.judge_model:
                     judge_command.extend(["-m", self.judge_model])
                 judge_command.extend([
@@ -918,6 +985,8 @@ class InteractiveRunner:
         tmux_bin: str,
         worker_sandbox: str,
         judge_sandbox: str,
+        worker_approval_policy: str,
+        judge_approval_policy: str,
         bypass_approvals_and_sandbox: bool,
         attach: bool,
         idle_seconds: int,
@@ -934,6 +1003,8 @@ class InteractiveRunner:
         self.tmux_bin = tmux_bin
         self.worker_sandbox = worker_sandbox
         self.judge_sandbox = judge_sandbox
+        self.worker_approval_policy = worker_approval_policy
+        self.judge_approval_policy = judge_approval_policy
         self.bypass_approvals_and_sandbox = bypass_approvals_and_sandbox
         self.attach = attach
         self.idle_seconds = idle_seconds
@@ -946,33 +1017,49 @@ class InteractiveRunner:
         self.logs_dir = self.runtime_dir / "interactive"
         self.state_path = self.runtime_dir / "state.json"
 
-    def _worker_activation_path(self) -> Path:
-        return self.logs_dir / "worker-activated.txt"
+    def _worker_turn_events_path(self) -> Path:
+        return self.logs_dir / "worker-turn-events.jsonl"
 
-    def _interactive_command(self, *, prompt: str, model: str | None, sandbox: str, session_id: str | None = None) -> str:
+    def _notify_argv(self, *, role: str) -> list[str]:
+        return _notify_hook_argv(role=role, output_path=self._worker_turn_events_path())
+
+    def _interactive_command(
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        sandbox: str,
+        approval_policy: str,
+        session_id: str | None = None,
+        notify_argv: list[str] | None = None,
+    ) -> str:
         if session_id:
             parts = [
                 self.codex_bin,
                 "resume",
-                *_base_codex_args(sandbox=sandbox, bypass=self.bypass_approvals_and_sandbox),
+                *_base_codex_args(sandbox=sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=approval_policy),
                 "-C",
                 str(self.repo_root),
                 "--no-alt-screen",
             ]
             if model:
                 parts.extend(["-m", model])
+            if notify_argv:
+                parts.extend(["-c", f"notify={json.dumps(notify_argv)}"])
             parts.extend([session_id, prompt])
             return _shell_join(parts)
 
         parts = [
             self.codex_bin,
-            *_base_codex_args(sandbox=sandbox, bypass=self.bypass_approvals_and_sandbox),
+            *_base_codex_args(sandbox=sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=approval_policy),
             "-C",
             str(self.repo_root),
             "--no-alt-screen",
         ]
         if model:
             parts.extend(["-m", model])
+        if notify_argv:
+            parts.extend(["-c", f"notify={json.dumps(notify_argv)}"])
         parts.append(prompt)
         return _shell_join(parts)
 
@@ -1003,6 +1090,7 @@ class InteractiveRunner:
 
         worker_log = self.logs_dir / "worker-pane.log"
         judge_log = self.logs_dir / "judge-pane.log"
+        self._worker_turn_events_path().write_text("", encoding="utf-8")
         tmux.pipe_pane(layout.worker_pane, worker_log)
         tmux.pipe_pane(layout.judge_pane, judge_log)
 
@@ -1013,28 +1101,29 @@ class InteractiveRunner:
         worker_script.write_text(
             "#!/usr/bin/env bash\n"
             f"cd {shlex.quote(str(self.repo_root))}\n"
-            f"exec {self._interactive_command(prompt=worker_prompt, model=self.worker_model, sandbox=self.worker_sandbox)}\n",
+            f"exec {self._interactive_command(prompt=worker_prompt, model=self.worker_model, sandbox=self.worker_sandbox, approval_policy=self.worker_approval_policy, notify_argv=self._notify_argv(role='worker'))}\n",
             encoding="utf-8",
         )
         worker_script.chmod(0o755)
         tmux.run_script(layout.worker_pane, str(worker_script))
+        _auto_accept_trust_prompt(tmux, layout.worker_pane, timeout_seconds=20)
 
         judge_prompt = _build_interactive_judge_standby_prompt()
         judge_script = self.logs_dir / "start-judge.sh"
         judge_script.write_text(
             "#!/usr/bin/env bash\n"
             f"cd {shlex.quote(str(self.repo_root))}\n"
-            f"exec {self._interactive_command(prompt=judge_prompt, model=self.judge_model, sandbox=self.judge_sandbox)}\n",
+            f"exec {self._interactive_command(prompt=judge_prompt, model=self.judge_model, sandbox=self.judge_sandbox, approval_policy=self.judge_approval_policy)}\n",
             encoding="utf-8",
         )
         judge_script.chmod(0o755)
         tmux.run_script(layout.judge_pane, str(judge_script))
+        _auto_accept_trust_prompt(tmux, layout.judge_pane, timeout_seconds=20)
 
         watcher_log = self.logs_dir / "watcher.log"
         watcher_command = [
             sys.executable,
-            "-m",
-            "codex_runner",
+            str(Path(__file__).with_name("watch_entry.py")),
             "watch",
             str(self.repo_root),
             "--session-name",
@@ -1049,8 +1138,12 @@ class InteractiveRunner:
             self.tmux_bin,
             "--judge-sandbox",
             self.judge_sandbox,
+            "--judge-approval-policy",
+            self.judge_approval_policy,
             "--worker-sandbox",
             self.worker_sandbox,
+            "--worker-approval-policy",
+            self.worker_approval_policy,
             "--idle-seconds",
             str(self.idle_seconds),
             "--poll-seconds",
@@ -1069,8 +1162,6 @@ class InteractiveRunner:
         if self.bypass_approvals_and_sandbox:
             watcher_command.append("--dangerous")
         env = os.environ.copy()
-        project_root = str(Path(__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = f"{project_root}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else project_root
         watcher_log_handle = watcher_log.open("a", encoding="utf-8")
         watcher = subprocess.Popen(
             watcher_command,
@@ -1116,8 +1207,10 @@ class JudgeWatcher:
         tmux_bin: str,
         judge_model: str | None,
         judge_sandbox: str,
+        judge_approval_policy: str,
         worker_model: str | None,
         worker_sandbox: str,
+        worker_approval_policy: str,
         bypass_approvals_and_sandbox: bool,
         idle_seconds: int,
         poll_seconds: int,
@@ -1133,8 +1226,10 @@ class JudgeWatcher:
         self.tmux_bin = tmux_bin
         self.judge_model = judge_model
         self.judge_sandbox = judge_sandbox
+        self.judge_approval_policy = judge_approval_policy
         self.worker_model = worker_model
         self.worker_sandbox = worker_sandbox
+        self.worker_approval_policy = worker_approval_policy
         self.bypass_approvals_and_sandbox = bypass_approvals_and_sandbox
         self.idle_seconds = idle_seconds
         self.poll_seconds = poll_seconds
@@ -1154,6 +1249,9 @@ class JudgeWatcher:
     def _worker_log_path(self) -> Path:
         return self.logs_dir / "worker-pane.log"
 
+    def _worker_turn_events_path(self) -> Path:
+        return self.logs_dir / "worker-turn-events.jsonl"
+
     def _judge_log_path(self) -> Path:
         return self.logs_dir / "judge-pane.log"
 
@@ -1162,6 +1260,22 @@ class JudgeWatcher:
 
     def _log_watcher_event(self, event: str, **payload: Any) -> None:
         _append_jsonl(self._watcher_log_path(), {"event": event, **payload})
+
+    def _bootstrap_worker_pane(self) -> None:
+        _auto_accept_trust_prompt(
+            self.tmux,
+            self.worker_pane,
+            timeout_seconds=8,
+            on_accept=lambda: self._log_watcher_event("worker_trust_prompt_accepted", worker_pane=self.worker_pane),
+        )
+
+    def _bootstrap_judge_pane(self) -> None:
+        _auto_accept_trust_prompt(
+            self.tmux,
+            self.judge_pane,
+            timeout_seconds=8,
+            on_accept=lambda: self._log_watcher_event("judge_trust_prompt_accepted", judge_pane=self.judge_pane),
+        )
 
     def _detect_worker_session_id(self) -> str | None:
         log_path = self._worker_log_path()
@@ -1202,25 +1316,41 @@ class JudgeWatcher:
         return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
 
     def _new_worker_command(self, prompt: str) -> str:
-        parts = [self.codex_bin, *_base_codex_args(sandbox=self.worker_sandbox, bypass=self.bypass_approvals_and_sandbox), "-C", str(self.repo_root), "--no-alt-screen"]
+        parts = [self.codex_bin, *_base_codex_args(sandbox=self.worker_sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=self.worker_approval_policy), "-C", str(self.repo_root), "--no-alt-screen", "-c", f"notify={json.dumps(_notify_hook_argv(role='worker', output_path=self._worker_turn_events_path()))}"]
         if self.worker_model:
             parts.extend(["-m", self.worker_model])
         parts.append(prompt)
         return _shell_join(parts)
 
     def _resume_command(self, session_id: str, prompt: str) -> str:
-        parts = [self.codex_bin, "resume", *_base_codex_args(sandbox=self.worker_sandbox, bypass=self.bypass_approvals_and_sandbox), "-C", str(self.repo_root), "--no-alt-screen"]
+        parts = [self.codex_bin, "resume", *_base_codex_args(sandbox=self.worker_sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=self.worker_approval_policy), "-C", str(self.repo_root), "--no-alt-screen", "-c", f"notify={json.dumps(_notify_hook_argv(role='worker', output_path=self._worker_turn_events_path()))}"]
         if self.worker_model:
             parts.extend(["-m", self.worker_model])
         parts.extend([session_id, prompt])
         return _shell_join(parts)
+
+    def _read_worker_turn_events_since(self, offset: int) -> tuple[int, list[dict[str, Any]]]:
+        path = self._worker_turn_events_path()
+        if not path.exists():
+            return offset, []
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_offset = len(lines)
+        events: list[dict[str, Any]] = []
+        for raw_line in lines[offset:]:
+            try:
+                payload = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("role") == "worker":
+                events.append(payload)
+        return new_offset, events
 
     def _judge_command(self, prompt: str, session_id: str | None) -> str:
         if session_id:
             parts = [
                 self.codex_bin,
                 "resume",
-                *_base_codex_args(sandbox=self.judge_sandbox, bypass=self.bypass_approvals_and_sandbox),
+                *_base_codex_args(sandbox=self.judge_sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=self.judge_approval_policy),
                 "-C",
                 str(self.repo_root),
                 "--no-alt-screen",
@@ -1232,7 +1362,7 @@ class JudgeWatcher:
 
         parts = [
             self.codex_bin,
-            *_base_codex_args(sandbox=self.judge_sandbox, bypass=self.bypass_approvals_and_sandbox),
+            *_base_codex_args(sandbox=self.judge_sandbox, bypass=self.bypass_approvals_and_sandbox, approval_policy=self.judge_approval_policy),
             "-C",
             str(self.repo_root),
             "--no-alt-screen",
@@ -1267,6 +1397,7 @@ class JudgeWatcher:
         script_path.chmod(0o755)
         self.tmux.run_script(self.judge_pane, str(script_path))
         self.tmux.pipe_pane(self.judge_pane, self._judge_log_path())
+        self._bootstrap_judge_pane()
 
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -1278,7 +1409,7 @@ class JudgeWatcher:
             time.sleep(0.5)
         return state.judge_session_id
 
-    def _run_judge(self, contract: FinishContract, finish_markdown: str, deterministic_report: DeterministicReport, pane_text: str, state: RunnerState) -> tuple[JudgeDecision, int]:
+    def _run_judge(self, contract: FinishContract, finish_markdown: str, deterministic_report: DeterministicReport, worker_turn_summary: str, state: RunnerState) -> tuple[JudgeDecision, int]:
         round_dir = self.logs_dir / f"watch-{time.time_ns()}"
         round_dir.mkdir(parents=True, exist_ok=True)
         decision_path = round_dir / "decision.json"
@@ -1288,7 +1419,7 @@ class JudgeWatcher:
             task=contract.task,
             finish_contract_markdown=finish_markdown,
             deterministic_report=deterministic_report,
-            worker_console_tail=pane_text,
+            worker_turn_summary=worker_turn_summary,
             repo_context=_repo_context(self.repo_root),
             output_path=decision_path,
         )
@@ -1381,7 +1512,8 @@ class JudgeWatcher:
             started_without_task=bool(payload.get("started_without_task", False)),
             awaiting_worker_change_after_complete=bool(payload.get("awaiting_worker_change_after_complete", False)),
             completion_latch_hash=payload.get("completion_latch_hash"),
-            standby_prompt_count=payload.get("standby_prompt_count"),
+            startup_turn_consumed=bool(payload.get("startup_turn_consumed", False)),
+            worker_event_offset=int(payload.get("worker_event_offset", 0)),
         )
 
     def _save_state(self, state: RunnerState) -> None:
@@ -1415,6 +1547,7 @@ class JudgeWatcher:
             script_path.chmod(0o755)
             self.tmux.run_script(self.worker_pane, str(script_path))
             self.tmux.pipe_pane(self.worker_pane, self._worker_log_path())
+            self._bootstrap_worker_pane()
             self._log_watcher_event(
                 "worker_transfer_delivered",
                 transfer_kind="continue",
@@ -1477,6 +1610,7 @@ class JudgeWatcher:
         script_path.chmod(0o755)
         self.tmux.run_script(self.worker_pane, str(script_path))
         self.tmux.pipe_pane(self.worker_pane, self._worker_log_path())
+        self._bootstrap_worker_pane()
         state.worker_session_id = None
         state.worker_reboots += 1
         self.last_hash = ""
@@ -1564,12 +1698,14 @@ class JudgeWatcher:
         script_path.chmod(0o755)
         self.tmux.run_script(self.worker_pane, str(script_path))
         self.tmux.pipe_pane(self.worker_pane, self._worker_log_path())
+        self._bootstrap_worker_pane()
         state.worker_session_id = None
         state.standby = True
+        state.started_without_task = True
         state.status = "running"
         state.awaiting_worker_change_after_complete = False
         state.completion_latch_hash = None
-        state.standby_prompt_count = None
+        state.startup_turn_consumed = False
         self._log_watcher_event(
             "worker_reset_to_standby",
             worker_pane=self.worker_pane,
@@ -1583,125 +1719,131 @@ class JudgeWatcher:
     def run(self) -> int:
         contract, finish_markdown = _ensure_plan_files(self.repo_root, None)
         state = self._load_state()
+        self._bootstrap_worker_pane()
+        self._bootstrap_judge_pane()
         try:
             while True:
-                pane_text = self.tmux.capture_pane(self.worker_pane, lines=200)
-                pane_hash = hashlib.sha256(pane_text.encode("utf-8", errors="ignore")).hexdigest()
-                current_command = self.tmux.pane_current_command(self.worker_pane)
                 session_id = self._detect_worker_session_id()
                 if session_id and state.worker_session_id != session_id:
                     state.worker_session_id = session_id
                     self._save_state(state)
 
-                if state.standby:
-                    prompt_count = _prompt_line_count(pane_text)
-                    if state.standby_prompt_count is None:
-                        state.standby_prompt_count = prompt_count
-                        self._save_state(state)
-                        time.sleep(self.poll_seconds)
-                        continue
-                    elif prompt_count > state.standby_prompt_count:
+                new_offset, worker_events = self._read_worker_turn_events_since(state.worker_event_offset)
+                if new_offset != state.worker_event_offset:
+                    state.worker_event_offset = new_offset
+                    self._save_state(state)
+
+                if not worker_events:
+                    time.sleep(self.poll_seconds)
+                    continue
+
+                for worker_event in worker_events:
+                    pane_text = self.tmux.capture_pane(self.worker_pane, lines=200)
+                    current_command = self.tmux.pane_current_command(self.worker_pane)
+                    turn_id = str(worker_event.get("turn_id") or "")
+                    if state.standby:
+                        if not state.startup_turn_consumed:
+                            state.startup_turn_consumed = True
+                            self._save_state(state)
+                            self._log_watcher_event(
+                                "worker_startup_turn_ignored",
+                                worker_pane=self.worker_pane,
+                                turn_id=turn_id,
+                            )
+                            continue
                         state.standby = False
                         state.started_without_task = False
-                        state.awaiting_worker_change_after_complete = False
-                        state.completion_latch_hash = None
-                        state.standby_prompt_count = None
-                        self.last_hash = ""
-                        self.last_signature = ""
-                        self.last_change_at = time.time()
-                        self.last_action_at = 0.0
                         self._save_state(state)
                         self._log_watcher_event(
                             "worker_activated",
                             worker_pane=self.worker_pane,
-                            prompt_count=prompt_count,
+                            turn_id=turn_id,
                         )
-                    else:
-                        time.sleep(self.poll_seconds)
-                        continue
 
-                deterministic_report = run_deterministic_checks(self.repo_root, contract)
-                idle_now = self._is_idle(pane_text)
-                if idle_now:
+                    deterministic_report = run_deterministic_checks(self.repo_root, contract)
                     self._log_watcher_event(
-                        "worker_idle_detected",
+                        "worker_turn_completed",
                         worker_pane=self.worker_pane,
                         worker_session_id=state.worker_session_id,
+                        turn_id=turn_id,
                         deterministic_passed=deterministic_report.passed,
                     )
-                if idle_now:
-                    signature = self._signature(pane_text, deterministic_report)
-                    if signature != self.last_signature and (time.time() - self.last_action_at) >= self.idle_seconds:
-                        decision, judge_exit = self._run_judge(contract, finish_markdown, deterministic_report, pane_text, state)
-                        self.last_signature = signature
-                        self.last_action_at = time.time()
-                        state.current_round += 1
-                        state.rounds.append(
-                            asdict(
-                                RoundRecord(
-                                    round_number=state.current_round,
-                                    worker_exit_code=0,
-                                    judge_exit_code=judge_exit,
-                                    worker_session_id=state.worker_session_id,
-                                    worker_result=asdict(WorkerResult.fallback("interactive worker under observation")),
-                                    judge_decision=asdict(decision),
-                                    deterministic_report=deterministic_report.to_dict(),
-                                )
+                    decision, judge_exit = self._run_judge(
+                        contract,
+                        finish_markdown,
+                        deterministic_report,
+                        _worker_turn_summary_from_event(worker_event),
+                        state,
+                    )
+                    state.current_round += 1
+                    state.rounds.append(
+                        asdict(
+                            RoundRecord(
+                                round_number=state.current_round,
+                                worker_exit_code=0,
+                                judge_exit_code=judge_exit,
+                                worker_session_id=state.worker_session_id,
+                                worker_result=asdict(WorkerResult.fallback("interactive worker under observation")),
+                                judge_decision=asdict(decision),
+                                deterministic_report=deterministic_report.to_dict(),
                             )
                         )
-                        if decision.decision == "complete" and deterministic_report.passed:
-                            self._reset_worker_to_standby(state)
-                            self._save_state(state)
-                            self._log_watcher_event(
-                                "judge_complete_nonterminal",
-                                round_number=state.current_round,
-                                decision=asdict(decision),
-                                started_without_task=state.started_without_task,
-                            )
-                            print("judge: completion approved -> worker reset to standby")
-                            continue
-                        if decision.decision == "blocked":
-                            state.status = "blocked"
-                            self._save_state(state)
-                            self._log_watcher_event(
-                                "judge_blocked_nonterminal",
-                                round_number=state.current_round,
-                                decision=asdict(decision),
-                            )
-                            print("judge: blocked")
-                            continue
-                        if decision.instructions_for_worker:
-                            if self._should_shower(round_number=state.current_round, decision=decision):
-                                self._perform_shower(
-                                    state=state,
-                                    current_command=current_command,
-                                    pane_text=pane_text,
-                                    instructions=decision.instructions_for_worker,
-                                    round_number=state.current_round,
-                                )
-                                self._log_watcher_event(
-                                    "worker_transfer_skipped_for_shower",
-                                    round_number=state.current_round,
-                                    decision=asdict(decision),
-                                )
-                                print(f"judge: continue -> shower reboot after round {state.current_round}")
-                            else:
-                                delivery_method = self._send_continue(session_id, decision.instructions_for_worker, current_command)
-                                self._log_watcher_event(
-                                    "worker_transfer_complete",
-                                    round_number=state.current_round,
-                                    decision=asdict(decision),
-                                    delivery_method=delivery_method,
-                                    worker_session_id=session_id,
-                                )
-                                print(f"judge: continue -> {decision.instructions_for_worker}")
-                        else:
-                            self._log_watcher_event(
-                                "worker_transfer_skipped_no_instructions",
-                                round_number=state.current_round,
-                                decision=asdict(decision),
-                            )
+                    )
+                    if decision.decision == "complete" and deterministic_report.passed:
+                        self._reset_worker_to_standby(state)
+                        state.started_without_task = True
+                        state.startup_turn_consumed = False
                         self._save_state(state)
+                        self._log_watcher_event(
+                            "judge_complete_nonterminal",
+                            round_number=state.current_round,
+                            decision=asdict(decision),
+                            started_without_task=state.started_without_task,
+                        )
+                        print("judge: completion approved -> worker reset to standby")
+                        continue
+                    if decision.decision == "blocked":
+                        state.status = "blocked"
+                        self._save_state(state)
+                        self._log_watcher_event(
+                            "judge_blocked_nonterminal",
+                            round_number=state.current_round,
+                            decision=asdict(decision),
+                        )
+                        print("judge: blocked")
+                        continue
+                    if decision.instructions_for_worker:
+                        if self._should_shower(round_number=state.current_round, decision=decision):
+                            self._perform_shower(
+                                state=state,
+                                current_command=current_command,
+                                pane_text=pane_text,
+                                instructions=decision.instructions_for_worker,
+                                round_number=state.current_round,
+                            )
+                            self._log_watcher_event(
+                                "worker_transfer_skipped_for_shower",
+                                round_number=state.current_round,
+                                decision=asdict(decision),
+                            )
+                            print(f"judge: continue -> shower reboot after round {state.current_round}")
+                        else:
+                            delivery_method = self._send_continue(session_id, decision.instructions_for_worker, current_command)
+                            self._log_watcher_event(
+                                "worker_transfer_complete",
+                                round_number=state.current_round,
+                                decision=asdict(decision),
+                                delivery_method=delivery_method,
+                                worker_session_id=session_id,
+                            )
+                            print(f"judge: continue -> {decision.instructions_for_worker}")
+                    else:
+                        self._log_watcher_event(
+                            "worker_transfer_skipped_no_instructions",
+                            round_number=state.current_round,
+                            decision=asdict(decision),
+                        )
+                    self._save_state(state)
                 time.sleep(self.poll_seconds)
         finally:
             latest_state = self._load_state()

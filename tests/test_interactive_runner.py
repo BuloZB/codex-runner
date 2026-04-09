@@ -9,10 +9,33 @@ from unittest.mock import Mock, patch
 
 from codex_runner.checks import CheckResult, DeterministicReport
 from codex_runner.config import init_plan
-from codex_runner.runner import JudgeDecision, JudgeWatcher
+from codex_runner.runner import (
+    JudgeDecision,
+    JudgeWatcher,
+    _auto_accept_trust_prompt,
+    _base_codex_args,
+)
 
 
 class InteractiveWatcherTests(unittest.TestCase):
+    def test_base_codex_args_include_approval_policy_when_not_bypassing(self) -> None:
+        self.assertEqual(
+            _base_codex_args(sandbox="danger-full-access", bypass=False, approval_policy="never"),
+            ["-a", "never", "-s", "danger-full-access"],
+        )
+
+    def test_auto_accept_trust_prompt_sends_confirmation_once(self) -> None:
+        tmux = Mock()
+        tmux.capture_pane.side_effect = [
+            "Do you trust the contents of this directory?\n1. Yes, continue",
+            "OpenAI Codex\nStanding by",
+        ]
+
+        accepted = _auto_accept_trust_prompt(tmux, "%1", timeout_seconds=1)
+
+        self.assertTrue(accepted)
+        tmux.press_enter.assert_called_once_with("%1")
+
     def test_run_judge_uses_visible_judge_pane_and_waits_for_decision_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -26,8 +49,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -68,7 +93,7 @@ class InteractiveWatcherTests(unittest.TestCase):
                         passed=False,
                         checks=[CheckResult(name="todo", passed=False, detail="active")],
                     ),
-                    pane_text="worker idle",
+                    worker_turn_summary="worker turn summary",
                     state=state,
                 )
 
@@ -121,8 +146,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -134,8 +161,6 @@ class InteractiveWatcherTests(unittest.TestCase):
             watcher.tmux.capture_pane.return_value = "worker idle"
             watcher.tmux.pane_current_command.return_value = "codex"
             watcher._detect_worker_session_id = Mock(return_value=None)
-            watcher._is_idle = Mock(return_value=True)
-            watcher._signature = Mock(return_value="sig")
             watcher._run_judge = Mock(
                 return_value=(
                     JudgeDecision(
@@ -147,6 +172,11 @@ class InteractiveWatcherTests(unittest.TestCase):
                     ),
                     0,
                 )
+            )
+            watcher._worker_turn_events_path().parent.mkdir(parents=True, exist_ok=True)
+            watcher._worker_turn_events_path().write_text(
+                json.dumps({"role": "worker", "turn_id": "turn-1", "input_messages": ["do it"], "last_assistant_message": "done"}) + "\n",
+                encoding="utf-8",
             )
 
             with patch("codex_runner.runner.time.sleep", side_effect=SystemExit(0)):
@@ -173,8 +203,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -215,8 +247,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -264,8 +298,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -321,8 +357,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -389,8 +427,10 @@ class InteractiveWatcherTests(unittest.TestCase):
                 tmux_bin="tmux",
                 judge_model=None,
                 judge_sandbox="danger-full-access",
+                judge_approval_policy="never",
                 worker_model=None,
                 worker_sandbox="danger-full-access",
+                worker_approval_policy="never",
                 bypass_approvals_and_sandbox=False,
                 idle_seconds=1,
                 poll_seconds=1,
@@ -399,13 +439,31 @@ class InteractiveWatcherTests(unittest.TestCase):
                 shower_timeout_seconds=30,
             )
             watcher.tmux = Mock()
-            watcher.tmux.capture_pane.side_effect = [
-                "› startup prompt\nworker idle",
-                "› startup prompt\n› user task\nworker idle",
-            ]
+            watcher.tmux.capture_pane.return_value = "worker idle"
             watcher.tmux.pane_current_command.return_value = "codex"
             watcher._detect_worker_session_id = Mock(return_value="abc")
-            watcher._run_judge = Mock()
+            watcher._run_judge = Mock(
+                return_value=(
+                    JudgeDecision(
+                        decision="continue",
+                        summary="keep going",
+                        reasons=["needs more"],
+                        instructions_for_worker="",
+                        missing_checks=[],
+                    ),
+                    0,
+                )
+            )
+            watcher._worker_turn_events_path().parent.mkdir(parents=True, exist_ok=True)
+            watcher._worker_turn_events_path().write_text(
+                "\n".join(
+                    [
+                        json.dumps({"role": "worker", "turn_id": "turn-startup", "input_messages": ["standby"], "last_assistant_message": "standing by"}),
+                        json.dumps({"role": "worker", "turn_id": "turn-user", "input_messages": ["real task"], "last_assistant_message": "working"}),
+                    ]
+                ) + "\n",
+                encoding="utf-8",
+            )
 
             sleep_calls = {"count": 0}
 
@@ -422,7 +480,7 @@ class InteractiveWatcherTests(unittest.TestCase):
             self.assertFalse(saved["standby"])
             self.assertFalse(saved["started_without_task"])
             self.assertEqual(saved["status"], "running")
-            watcher._run_judge.assert_not_called()
+            watcher._run_judge.assert_called_once()
 
 
 if __name__ == "__main__":
